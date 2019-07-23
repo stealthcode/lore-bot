@@ -1,12 +1,12 @@
 #[macro_use]
 extern crate tantivy;
-use tantivy::collector::TopDocs;
-use tantivy::query::{QueryParser, TermQuery};
-use tantivy::schema::*;
-use tantivy::tokenizer::*;
-
-use tantivy::{Index, IndexReader, IndexWriter};
-use tantivy::ReloadPolicy;
+use tantivy::{
+    collector::TopDocs,
+    query::{QueryParser, TermQuery},
+    schema::*,
+    tokenizer::*,
+    {Index, IndexReader, IndexWriter, ReloadPolicy},
+};
 
 extern crate tempdir;
 use tempdir::TempDir;
@@ -14,11 +14,26 @@ use tempdir::TempDir;
 extern crate chrono;
 use chrono::{DateTime, Utc};
 
-use std::path::Path;
-
-use std::collections::HashMap;
+use std::{
+    {env},
+    sync::{Arc, Mutex},
+    path::Path,
+    collections::HashMap,
+};
 
 use serde::{Serialize, Deserialize};
+
+use serenity::{
+    model::{
+        channel::{
+            Message, 
+            MessageType::Regular,
+        }, 
+        gateway::Ready,
+    },
+    prelude::*,
+};
+
 
 trait SearchableContent {
     fn get_id(self) -> String;
@@ -139,31 +154,6 @@ impl Default for JournalEntry {
     }
 }
 
-struct Bot<'a> {
-    search_indices: HashMap<String, SearchIndex>,
-    repo: LoreRepo,
-}
-
-trait LoreRepo {
-    fn get_publications_for_principle(p: String) -> Result<Vec<Publication>, String>;
-    fn get_lore_for_publication(p: Publication) -> Result<Vec<Lore>, String>;
-    fn get_journals_for_publication(p: Publication) -> Result<Vec<JournalEntry>, String>;
-}
-
-impl LoreRepo {
-    fn initialize() -> Result<(), String> {
-        // table of lore publications with collection of lore URIs
-        // table of journal publications with collection of journal IDs, URIs
-        // for each principle - 
-        // find publications that allow read access for all principles
-        //      get set of all URIs
-        //      for each URI
-        //      lookup content
-        //      add as SearchableContent to principle's SearchIndex
-        Ok(())
-    }
-}
-
 struct SearchIndex {
     reader: IndexReader,
     index_writer: IndexWriter,
@@ -177,7 +167,7 @@ struct SearchIndex {
 impl SearchIndex {
     fn search(self, search :String) -> tantivy::Result<Vec<String>> {
         let searcher = self.reader.searcher();
-        let query = self.query_parser.parse_query("sea whale")?;
+        let query = self.query_parser.parse_query(&search)?;
         let top_docs = searcher.search(&query, &TopDocs::with_limit(10))?;
         let mut results = Vec::new();
         for (_score, doc_address) in top_docs {
@@ -227,7 +217,7 @@ impl SearchIndex {
     }
 }
 
-fn build_index<T, P>(directory_path : P, entries: Vec<T>) -> tantivy::Result<SearchIndex> 
+fn build_index<T, P>(entries: Vec<T>) -> tantivy::Result<SearchIndex> 
     where T: SearchableContent + Copy,
     P: AsRef<Path>,
 {
@@ -268,7 +258,7 @@ fn build_index<T, P>(directory_path : P, entries: Vec<T>) -> tantivy::Result<Sea
 
     let schema = schema_builder.build();
 
-    let index = Index::create_in_dir(directory_path, schema.clone())?;
+    let index = Index::create_in_dir(index_path, schema.clone())?;
 
     let tokenizer = SimpleTokenizer
         .filter(LowerCaser)
@@ -308,6 +298,108 @@ fn build_index<T, P>(directory_path : P, entries: Vec<T>) -> tantivy::Result<Sea
         content_schema: content_schema,
         index_writer: index_writer,
     })
+}
+
+#[derive(Clone)]
+struct BotEventHandler {
+    search_indices: Arc<HashMap<String, Arc<Mutex<SearchIndex>>>>,
+    repo: Arc<LoreRepo>,
+}
+
+impl EventHandler for BotEventHandler {
+    // Event handlers are dispatched through a threadpool, and so multiple
+    // events can be dispatched simultaneously.
+    fn message(&self, ctx: Context, msg: Message) {
+        if msg.kind == Regular && msg.content.starts_with("!find") {
+            let principle = msg.channel_id.name(ctx.cache).unwrap_or(msg.author.name);
+            let response = match self.clone().handle_search(msg.content, principle) {
+                Ok(response) => format!("Found: {}", response),
+                Err(err_response) => format!("Error: {}", err_response),
+            };
+            if let Err(why) = msg.channel_id.say(&ctx.http, response) {
+                println!("Error sending message: {:?}", why);
+            };
+        }
+    }
+}
+
+impl BotEventHandler {
+    fn handle_search(self, content: String, principle: String) -> Result<String, String> {
+        let mut split = content.split_whitespace();
+        split.next();
+        if let Some(search_term) = split.next() {
+            if let Some(mutex) = self.search_indices.get(&principle).clone() {
+                let lock = match mutex.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                match lock.search(search_term.to_string()) {
+                    Ok(top_docs) =>  Ok(top_docs.join("\n")),
+                    Err(err) => Err(format!("Could not find any results. {}", err)),
+                }
+            } else {
+                Err("Could not accquire lock for search index".to_string())
+            }
+        } else {
+            Err("Invalid find command. Search term must be specified".to_string())
+        }
+    }
+
+    // Set a handler to be called on the `ready` event. This is called when a
+    // shard is booted, and a READY payload is sent by Discord. This payload
+    // contains data like the current user's guild Ids, current user data,
+    // private channels, and more.
+    //
+    // In this case, just print what the current user's username is.
+    fn ready(&self, _: Context, ready: Ready) {
+        println!("Bot User '{}' is connected!", ready.user.name);
+    }
+}
+
+struct LoreRepo {
+    
+}
+
+impl LoreRepo {
+    fn initialize() -> Result<(), String> {
+        // table of lore publications with collection of lore URIs
+        // table of journal publications with collection of journal IDs, URIs
+        // for each principle - 
+        // find publications that allow read access for all principles
+        //      get set of all URIs
+        //      for each URI
+        //      lookup content
+        //      add as SearchableContent to principle's SearchIndex
+        Ok(())
+    }
+
+    fn get_publications_for_principle(p: String) -> Result<Vec<Publication>, String> {
+        Ok(vec![])
+    }
+
+    fn get_lore_for_publication(p: Publication) -> Result<Vec<Lore>, String> {
+        Ok(vec![])
+    }
+
+    fn get_journals_for_publication(p: Publication) -> Result<Vec<JournalEntry>, String> {
+        Ok(vec![])
+    }
+
+}
+
+fn main() {
+    let token = env::var("DISCORD_TOKEN")
+        .expect("Expected a token in the environment");
+    let eventHandler = BotEventHandler{
+        search_indices: Arc::new(HashMap::new()),
+        repo: Arc::new(LoreRepo{}),
+    };
+    let mut client = Client::new(&token, eventHandler).expect("Err creating client");
+    if let Err(why) = client.start() {
+        println!("Client error: {:?}", why);
+    }
+
+
 }
 
 #[cfg(test)]
