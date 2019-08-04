@@ -418,20 +418,19 @@ impl fmt::Display for LoreBotError {
 impl BotEventHandler {
     fn handle_search(self, content: String, principle: String) -> Result<String, LoreBotError> {
         let mut split = content.splitn(2, ' ');
-        split.next().and_then(|_| split.next())
-            .ok_or(err_fmt!("Invalid find command - search term must be specified"))
-            .and_then(|search_term| 
-                self.search_indices.get(&principle).clone()
-                    .ok_or(err_fmt!("Could not find a search index for {}", principle))
-                    .and_then(|mutex| {
-                        let search_index = mutex.lock()
-                            .unwrap_or_else(|err| err.into_inner());
-                        search_index
-                            .search(search_term.to_string())
-                            .map(|top_docs| top_docs.join("\n"))
-                            .map_err(|error| error.into())
-                            
-                    }))
+        let search_term = split.next().and_then(|_| split.next())
+            .ok_or(err_fmt!("Invalid find command - search term must be specified"))?;
+            
+        let mutex = self.search_indices.get(&principle).clone()
+            .ok_or(err_fmt!("Could not find a search index for {}", principle))?;
+            
+        let search_index = mutex.lock()
+            .unwrap_or_else(|err| err.into_inner());
+            
+        search_index
+            .search(search_term.to_string())
+            .map(|top_docs| top_docs.join("\n"))
+            .map_err(|error| error.into())
     }
 
     // Set a handler to be called on the `ready` event. This is called when a
