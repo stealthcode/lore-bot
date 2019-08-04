@@ -356,31 +356,8 @@ fn build_index<T, P>(entries: Vec<T>) -> tantivy::Result<SearchIndex>
         id_schema: id_schema,
         title_schema: title_schema,
         content_schema: content_schema,
-        index_writer: index_writer,
+        index: index,
     })
-}
-
-#[derive(Clone)]
-struct BotEventHandler {
-    search_indices: Arc<HashMap<String, Arc<Mutex<SearchIndex>>>>,
-    repo: Arc<LoreRepo>,
-}
-
-impl EventHandler for BotEventHandler {
-    // Event handlers are dispatched through a threadpool, and so multiple
-    // events can be dispatched simultaneously.
-    fn message(&self, ctx: Context, msg: Message) {
-        if msg.kind == Regular && msg.content.starts_with("!find") {
-            let principle = msg.channel_id.name(ctx.cache).unwrap_or(msg.author.name);
-            let response = match self.clone().handle_search(msg.content, principle) {
-                Ok(response) => format!("Found: {}", response),
-                Err(err_response) => format!("Error: {}", err_response),
-            };
-            if let Err(why) = msg.channel_id.say(&ctx.http, response) {
-                println!("Error sending message: {:?}", why);
-            };
-        }
-    }
 }
 
 struct LoreBotError {
@@ -412,6 +389,29 @@ impl From<tantivy::TantivyError> for LoreBotError {
 impl fmt::Display for LoreBotError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "LoreBot Error - {}", self.discord_message)
+    }
+}
+
+#[derive(Clone)]
+struct BotEventHandler {
+    search_indices: Arc<HashMap<String, Arc<Mutex<SearchIndex>>>>,
+    repo: Arc<LoreRepo>,
+}
+
+impl EventHandler for BotEventHandler {
+    // Event handlers are dispatched through a threadpool, and so multiple
+    // events can be dispatched simultaneously.
+    fn message(&self, ctx: Context, msg: Message) {
+        if msg.kind == Regular && msg.content.starts_with("!find") {
+            let principle = msg.channel_id.name(ctx.cache).unwrap_or(msg.author.name);
+            let response = match self.clone().handle_search(msg.content, principle) {
+                Ok(response) => format!("Found: {}", response),
+                Err(err_response) => format!("Error: {}", err_response),
+            };
+            if let Err(why) = msg.channel_id.say(&ctx.http, response) {
+                println!("Error sending message: {:?}", why);
+            };
+        }
     }
 }
 
