@@ -5,7 +5,7 @@ use tantivy::{
     query::{QueryParser, TermQuery},
     schema::*,
     tokenizer::*,
-    {Index, IndexReader, IndexWriter, ReloadPolicy},
+    {Index, IndexReader, IndexWriter, ReloadPolicy, TantivyError},
 };
 
 extern crate tempdir;
@@ -15,7 +15,7 @@ extern crate chrono;
 use chrono::{DateTime, Utc};
 
 use std::{
-    {env},
+    {env, fmt},
     sync::{Arc, Mutex},
     path::Path,
     collections::HashMap,
@@ -34,11 +34,29 @@ use serenity::{
     prelude::*,
 };
 
+extern crate postgres;
 
-trait SearchableContent {
-    fn get_id(self) -> String;
-    fn get_title(self) -> String;
-    fn get_content(self) -> String;
+use postgres::{Connection, TlsMode};
+
+use uuid::{Uuid};
+
+
+
+/// Associated with one or more content structs to authorize a principle to read or mutate all associated content
+#[derive(Clone, Serialize, Deserialize)]
+struct Publication {
+    id: Uuid,
+    /// A name to uniquely identify this publication 
+    name: String,
+    /// The principle being authorized
+    principle: String,
+    /// Denotes if this publication allows read access
+    is_readable: bool,
+    /// Denotes if this publication allows mutation access
+    is_writable: bool,
+}
+
+impl Publication {
 }
 
 /// Content that may be restricted for viewing or editing by publications
@@ -60,40 +78,23 @@ trait Restrictable
     }
 }
 
-/// Associated with one or more content structs to authorize a principle to read or mutate all associated content
-#[derive(Clone, Serialize, Deserialize)]
-struct Publication {
-    /// A name to uniquely identify this publication 
-    name: String,
-    /// The principle being authorized
-    principle: String,
-    /// Denotes if this publication allows read access
-    is_readable: bool,
-    /// Denotes if this publication allows mutation access
-    is_writable: bool,
+trait SearchableContent {
+    fn get_id(self) -> Uuid;
+    fn get_title(self) -> String;
+    fn get_content(self) -> String;
 }
 
-impl Publication {
-}
-
-/// Lore is canonical description of an entity. It may be associated with multiple journal entries. Lore 
-/// entries may be unlocked or replaced through manipulation of publications.
-#[derive(Default, Serialize, Deserialize)]
-struct Lore {
+struct SearchableLore {
+    id: Uuid,
     /// A name to uniquely identify this Lore
     name: String,
     /// A content description
     content: String,
-    /// An indexed set of publications by principle
-    publications: HashMap<String, Publication>,
 }
 
-impl Lore {
-}
-
-impl SearchableContent for Lore {
-    fn get_id(self) -> String {
-        self.name
+impl SearchableContent for SearchableLore {
+    fn get_id(self) -> Uuid {
+        self.id
     }
 
     fn get_title(self) -> String {
@@ -105,22 +106,78 @@ impl SearchableContent for Lore {
     }
 }
 
+/// Lore is canonical description of an entity. It may be associated with multiple journal entries. Lore 
+/// entries may be unlocked or replaced through manipulation of publications.
+#[derive(Default, Serialize, Deserialize)]
+struct Lore {
+    id: Uuid,
+    /// A name to uniquely identify this Lore
+    name: String,
+    /// A content description
+    content: String,
+    /// An indexed set of publications by principle
+    publications: HashMap<String, Publication>,
+}
+
+impl Into<SearchableLore> for Lore {
+    fn into(self) -> SearchableLore {
+        SearchableLore{
+            id: self.id,
+            name: self.name,
+            content: self.content,
+        }
+    }
+}
+
 impl Restrictable for Lore {
     fn get_publications_for<'a>(&self, principle :&'a str) -> Option<&Publication> {
         self.publications.get(&principle.to_string())
     }
 }
 
+struct SearchableJournal {
+    id: Uuid,
+    /// A name to uniquely identify this Lore
+    name: String,
+    /// A content description
+    content: String,
+}
+
+impl SearchableContent for SearchableJournal {
+    fn get_id(self) -> Uuid {
+        self.id
+    }
+
+    fn get_title(self) -> String {
+        self.name
+    }
+
+    fn get_content(self) -> String {
+        self.content
+    }
+}
+
 struct JournalEntry {
+    id: Uuid,
     title: String,
     body: String,
     occurred_on: DateTime<Utc>,
     publications: HashMap<String, Publication>,
 }
 
+impl Into<SearchableJournal> for JournalEntry {
+    fn into(self) -> SearchableJournal {
+        SearchableJournal{
+            id: self.id,
+            name: self.title,
+            content: self.body,
+        }
+    }
+}
+
 impl Restrictable for JournalEntry {
     fn get_publications_for<'a>(&self, principle :&'a str) -> Option<&Publication> {
-        self.publications.get(&principle.to_string())
+        self.publications.get(principle)
     }
 }
 
@@ -135,6 +192,7 @@ impl JournalEntry {
                 m
             });
         JournalEntry {
+            id: Uuid::new_v4(),
             title: title.to_string(),
             body: body.to_string(),
             occurred_on: Utc::now(),
@@ -146,6 +204,7 @@ impl JournalEntry {
 impl Default for JournalEntry {
     fn default() -> Self {
         JournalEntry {
+            id: Uuid::new_v4(),
             title: Default::default(),
             body: Default::default(),
             occurred_on: Utc::now(),
@@ -154,6 +213,7 @@ impl Default for JournalEntry {
     }
 }
 
+#[derive(Clone)]
 struct SearchIndex {
     reader: IndexReader,
     index_writer: IndexWriter,
@@ -181,7 +241,7 @@ impl SearchIndex {
         where T: SearchableContent + Copy
     {
         self.index_writer.add_document(doc!(
-            self.id_schema => entry.get_id(),
+            self.id_schema => format!("{}", entry.get_id()),
             self.title_schema => entry.get_title(),
             self.content_schema => entry.get_content(),
         ));
@@ -191,7 +251,7 @@ impl SearchIndex {
         where T: SearchableContent + Copy
     {
         let id = entry.get_id();
-        let id_term = Term::from_field_text(self.id_schema, &id);
+        let id_term = Term::from_field_text(self.id_schema, &format!("{}", id));
         self.index_writer.delete_term(id_term);
         self.add(entry);
     }
@@ -276,7 +336,7 @@ fn build_index<T, P>(entries: Vec<T>) -> tantivy::Result<SearchIndex>
 
     for entry in entries {
         index_writer.add_document(doc!(
-            id_schema => entry.get_id(),
+            id_schema => format!("{}", entry.get_id()),
             title_schema => entry.get_title(),
             content_schema => entry.get_content(),
         ));
@@ -323,26 +383,55 @@ impl EventHandler for BotEventHandler {
     }
 }
 
-impl BotEventHandler {
-    fn handle_search(self, content: String, principle: String) -> Result<String, String> {
-        let mut split = content.split_whitespace();
-        split.next();
-        if let Some(search_term) = split.next() {
-            if let Some(mutex) = self.search_indices.get(&principle).clone() {
-                let lock = match mutex.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                match lock.search(search_term.to_string()) {
-                    Ok(top_docs) =>  Ok(top_docs.join("\n")),
-                    Err(err) => Err(format!("Could not find any results. {}", err)),
-                }
-            } else {
-                Err("Could not accquire lock for search index".to_string())
-            }
-        } else {
-            Err("Invalid find command. Search term must be specified".to_string())
+struct LoreBotError {
+    discord_message: String,
+}
+
+impl LoreBotError {
+    fn new(message: String) -> LoreBotError {
+        LoreBotError {
+            discord_message: message,
         }
+    }
+}
+
+macro_rules! err_fmt {
+    ($($arg:tt)*) => (LoreBotError{
+        discord_message: std::fmt::format(format_args!($($arg)*))
+    })
+}
+
+impl From<tantivy::TantivyError> for LoreBotError {
+    fn from(error: tantivy::TantivyError) -> Self {
+        LoreBotError {
+            discord_message: format!("{}", error)
+        }
+    }
+}
+
+impl fmt::Display for LoreBotError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "LoreBot Error - {}", self.discord_message)
+    }
+}
+
+impl BotEventHandler {
+    fn handle_search(self, content: String, principle: String) -> Result<String, LoreBotError> {
+        let mut split = content.splitn(2, ' ');
+        split.next().and_then(|_| split.next())
+            .ok_or(err_fmt!("Invalid find command - search term must be specified"))
+            .and_then(|search_term| 
+                self.search_indices.get(&principle).clone()
+                    .ok_or(err_fmt!("Could not find a search index for {}", principle))
+                    .and_then(|mutex| {
+                        let search_index = mutex.lock()
+                            .unwrap_or_else(|err| err.into_inner());
+                        search_index
+                            .search(search_term.to_string())
+                            .map(|top_docs| top_docs.join("\n"))
+                            .map_err(|error| error.into())
+                            
+                    }))
     }
 
     // Set a handler to be called on the `ready` event. This is called when a
@@ -362,6 +451,28 @@ struct LoreRepo {
 
 impl LoreRepo {
     fn initialize() -> Result<(), String> {
+        let conn = Connection::connect("postgres://postgres@localhost:5432", TlsMode::None).unwrap();
+        conn.execute("CREATE DATABASE IF NOT EXISTS lore", &[]).unwrap();
+
+        conn.execute("CREATE TABLE IF NOT EXISTS lore.publication (
+                        id              SERIAL PRIMARY KEY,
+                        name            VARCHAR NOT NULL,
+                        allows_read     BOOLEAN NOT NULL,
+                        allows_write    BOOLEAN NOT NULL
+                    )", &[]).unwrap();
+
+        conn.execute("CREATE TABLE IF NOT EXISTS lore.principles (
+                        id              SERIAL PRIMARY KEY,
+                        name            VARCHAR NOT NULL,
+                        discord_name    VARCHAR NOT NULL
+                    )", &[]).unwrap();
+
+        conn.execute("CREATE TABLE IF NOT EXISTS lore.lore (
+                        id              SERIAL PRIMARY KEY,
+                        name            VARCHAR NOT NULL
+                        content         VARCHAR NOT NULL
+                    )", &[]).unwrap();
+        
         // table of lore publications with collection of lore URIs
         // table of journal publications with collection of journal IDs, URIs
         // for each principle - 
