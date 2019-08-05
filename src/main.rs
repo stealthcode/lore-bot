@@ -2,14 +2,12 @@
 extern crate tantivy;
 use tantivy::{
     collector::TopDocs,
+    directory::{MmapDirectory},
     query::{QueryParser, TermQuery},
     schema::*,
     tokenizer::*,
     {Index, IndexReader, IndexWriter, ReloadPolicy, TantivyError},
 };
-
-extern crate tempdir;
-use tempdir::TempDir;
 
 extern crate chrono;
 use chrono::{DateTime, Utc};
@@ -41,6 +39,37 @@ use postgres::{Connection, TlsMode};
 use uuid::{Uuid};
 
 
+struct LoreBotError {
+    discord_message: String,
+}
+
+impl LoreBotError {
+    fn new(message: String) -> LoreBotError {
+        LoreBotError {
+            discord_message: message,
+        }
+    }
+}
+
+macro_rules! err_fmt {
+    ($($arg:tt)*) => (LoreBotError{
+        discord_message: std::fmt::format(format_args!($($arg)*))
+    })
+}
+
+impl From<tantivy::TantivyError> for LoreBotError {
+    fn from(error: tantivy::TantivyError) -> Self {
+        LoreBotError {
+            discord_message: format!("{}", error)
+        }
+    }
+}
+
+impl fmt::Display for LoreBotError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "LoreBot Error - {}", self.discord_message)
+    }
+}
 
 /// Associated with one or more content structs to authorize a principle to read or mutate all associated content
 #[derive(Clone, Serialize, Deserialize)]
@@ -84,6 +113,7 @@ trait SearchableContent {
     fn get_content(self) -> String;
 }
 
+#[derive(Clone, Debug)]
 struct SearchableLore {
     id: Uuid,
     /// A name to uniquely identify this Lore
@@ -216,18 +246,35 @@ impl Default for JournalEntry {
 #[derive(Clone)]
 struct SearchIndex {
     reader: IndexReader,
-    index_writer: IndexWriter,
-    query_parser: QueryParser,
+    index: Index,
     schema: Schema,
     id_schema: Field,
     title_schema: Field,
     content_schema: Field,
 }
 
+struct SearchIndexTx<'a> {
+    added: &'a mut Vec<SearchableLore>,
+    removed: &'a mut Vec<String>,
+}
+
+impl<'a> SearchIndexTx<'a> {
+    fn add(self, entry: SearchableLore) {
+        self.added.push(entry)
+    }
+
+    fn replace(self, entry: SearchableLore) {
+        let id = entry.clone().get_id();
+        self.removed.push(format!("{}", id));
+        self.add(entry);
+    }
+}
+
 impl SearchIndex {
-    fn search(self, search :String) -> tantivy::Result<Vec<String>> {
+    fn search(self, search : String) -> tantivy::Result<Vec<String>> {
         let searcher = self.reader.searcher();
-        let query = self.query_parser.parse_query(&search)?;
+        let query_parser = QueryParser::for_index(&self.index, vec![self.title_schema, self.content_schema]);
+        let query = query_parser.parse_query(&search)?;
         let top_docs = searcher.search(&query, &TopDocs::with_limit(10))?;
         let mut results = Vec::new();
         for (_score, doc_address) in top_docs {
@@ -237,28 +284,28 @@ impl SearchIndex {
         Ok(results)
     }
 
-    fn add<T>(mut self, entry: T) 
-        where T: SearchableContent + Copy
+    fn mutate<'a, F>(self, f: F) -> tantivy::Result<()>
+        where F: FnOnce(SearchIndexTx) -> tantivy::Result<()>
     {
-        self.index_writer.add_document(doc!(
-            self.id_schema => format!("{}", entry.get_id()),
-            self.title_schema => entry.get_title(),
-            self.content_schema => entry.get_content(),
-        ));
-    }
-
-    fn replace<T>(mut self, entry: T) 
-        where T: SearchableContent + Copy
-    {
-        let id = entry.get_id();
-        let id_term = Term::from_field_text(self.id_schema, &format!("{}", id));
-        self.index_writer.delete_term(id_term);
-        self.add(entry);
-    }
-
-    fn reload(mut self) -> tantivy::Result<()> {
-        self.index_writer.commit()?;
-        self.reader.reload()
+        let tx = SearchIndexTx {
+            added: &mut Vec::new(),
+            removed: &mut Vec::new(),
+        };
+        f(tx)?;
+        let mut writer = self.index.writer(50_000_000)?;
+        for entry in tx.added {
+            writer.add_document(doc!(
+                self.id_schema => format!("{}", entry.get_id()),
+                self.title_schema => entry.get_title(),
+                self.content_schema => entry.get_content(),
+            ));
+        }
+        for entry in tx.removed {
+            let id_term = Term::from_field_text(self.id_schema, &entry);
+            writer.delete_term(id_term);
+        }
+        writer.commit()?;
+        Ok(())
     }
 
     fn extract_doc_given_id(self, id: String) -> tantivy::Result<Option<Document>> {
@@ -281,7 +328,6 @@ fn build_index<T, P>(entries: Vec<T>) -> tantivy::Result<SearchIndex>
     where T: SearchableContent + Copy,
     P: AsRef<Path>,
 {
-    let index_path = TempDir::new("tantivy_example_dir")?;
     let mut schema_builder = Schema::builder();
     
     schema_builder.add_text_field("id", STRING | STORED);
@@ -318,7 +364,8 @@ fn build_index<T, P>(entries: Vec<T>) -> tantivy::Result<SearchIndex>
 
     let schema = schema_builder.build();
 
-    let index = Index::create_in_dir(index_path, schema.clone())?;
+    let index_path = MmapDirectory::open("index")?;
+    let index = Index::open_or_create(index_path, schema.clone())?;
 
     let tokenizer = SimpleTokenizer
         .filter(LowerCaser)
@@ -348,48 +395,14 @@ fn build_index<T, P>(entries: Vec<T>) -> tantivy::Result<SearchIndex>
         .reader_builder()
         .reload_policy(ReloadPolicy::OnCommit)
         .try_into()?;
-    let query_parser = QueryParser::for_index(&index, vec![title_schema, content_schema]);
     Ok(SearchIndex {
         reader: reader,
-        query_parser: query_parser,
         schema: schema,
         id_schema: id_schema,
         title_schema: title_schema,
         content_schema: content_schema,
         index: index,
     })
-}
-
-struct LoreBotError {
-    discord_message: String,
-}
-
-impl LoreBotError {
-    fn new(message: String) -> LoreBotError {
-        LoreBotError {
-            discord_message: message,
-        }
-    }
-}
-
-macro_rules! err_fmt {
-    ($($arg:tt)*) => (LoreBotError{
-        discord_message: std::fmt::format(format_args!($($arg)*))
-    })
-}
-
-impl From<tantivy::TantivyError> for LoreBotError {
-    fn from(error: tantivy::TantivyError) -> Self {
-        LoreBotError {
-            discord_message: format!("{}", error)
-        }
-    }
-}
-
-impl fmt::Display for LoreBotError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "LoreBot Error - {}", self.discord_message)
-    }
 }
 
 #[derive(Clone)]
@@ -427,7 +440,7 @@ impl BotEventHandler {
         let search_index = mutex.lock()
             .unwrap_or_else(|err| err.into_inner());
             
-        search_index
+        search_index.clone()
             .search(search_term.to_string())
             .map(|top_docs| top_docs.join("\n"))
             .map_err(|error| error.into())
