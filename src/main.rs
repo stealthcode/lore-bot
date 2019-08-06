@@ -108,9 +108,9 @@ trait Restrictable
 }
 
 trait SearchableContent {
-    fn get_id(self) -> Uuid;
-    fn get_title(self) -> String;
-    fn get_content(self) -> String;
+    fn get_id(&self) -> &Uuid;
+    fn get_title(&self) -> &str;
+    fn get_content(&self) -> &str;
 }
 
 #[derive(Clone, Debug)]
@@ -123,16 +123,16 @@ struct SearchableLore {
 }
 
 impl SearchableContent for SearchableLore {
-    fn get_id(self) -> Uuid {
-        self.id
+    fn get_id(&self) -> &Uuid {
+        &self.id
     }
 
-    fn get_title(self) -> String {
-        self.name
+    fn get_title(&self) -> &str {
+        &self.name
     }
 
-    fn get_content(self) -> String {
-        self.content
+    fn get_content(&self) -> &str {
+        &self.content
     }
 }
 
@@ -149,12 +149,12 @@ struct Lore {
     publications: HashMap<String, Publication>,
 }
 
-impl Into<SearchableLore> for Lore {
-    fn into(self) -> SearchableLore {
+impl From<Lore> for SearchableLore {
+    fn from(lore: Lore) -> SearchableLore {
         SearchableLore{
-            id: self.id,
-            name: self.name,
-            content: self.content,
+            id: lore.id,
+            name: lore.name,
+            content: lore.content,
         }
     }
 }
@@ -174,16 +174,16 @@ struct SearchableJournal {
 }
 
 impl SearchableContent for SearchableJournal {
-    fn get_id(self) -> Uuid {
-        self.id
+    fn get_id(&self) -> &Uuid {
+        &self.id
     }
 
-    fn get_title(self) -> String {
-        self.name
+    fn get_title(&self) -> &str {
+        &self.name
     }
 
-    fn get_content(self) -> String {
-        self.content
+    fn get_content(&self) -> &str {
+        &self.content
     }
 }
 
@@ -214,13 +214,10 @@ impl Restrictable for JournalEntry {
 impl JournalEntry {
     // public journal => publications [{$owner, is_writable: true, is_readable: true}, {'players', is_readable: true}]
     // private journal => publications [{$owner, is_writable: true, is_readable: true}]
-    fn new<'a> (title :&'a str, body :&'a str, principles :Vec<Publication>) -> JournalEntry {
-        let indexed_publications = principles.into_iter().fold(
-            HashMap::new(), 
-            |mut m, publication| {
-                m.insert(publication.principle.clone(), publication.clone());
-                m
-            });
+    fn new<'a> (title :&'a str, body :&'a str, publications :Vec<Publication>) -> JournalEntry {
+        let indexed_publications = publications.into_iter()
+            .map(|publication| (publication.principle.clone(), publication))
+            .collect::<HashMap<_, _>>();
         JournalEntry {
             id: Uuid::new_v4(),
             title: title.to_string(),
@@ -253,20 +250,28 @@ struct SearchIndex {
     content_schema: Field,
 }
 
-struct SearchIndexTx<'a> {
-    added: &'a mut Vec<SearchableLore>,
-    removed: &'a mut Vec<String>,
+#[derive(Default)]
+struct SearchIndexTx {
+    added: Vec<SearchableLore>,
+    removed: Vec<String>,
 }
 
-impl<'a> SearchIndexTx<'a> {
-    fn add(self, entry: SearchableLore) {
+impl SearchIndexTx {
+    pub fn add(mut self, entry: SearchableLore) {
         self.added.push(entry)
     }
 
-    fn replace(self, entry: SearchableLore) {
-        let id = entry.clone().get_id();
+    pub fn replace(mut self, entry: SearchableLore) {
+        let id = entry.get_id();
         self.removed.push(format!("{}", id));
         self.add(entry);
+    }
+
+    fn get_added(&self) -> &Vec<SearchableLore> {
+        &self.added
+    }
+    fn get_removed(&self) -> &Vec<String> {
+        &self.removed
     }
 }
 
@@ -287,20 +292,17 @@ impl SearchIndex {
     fn mutate<'a, F>(self, f: F) -> tantivy::Result<()>
         where F: FnOnce(SearchIndexTx) -> tantivy::Result<()>
     {
-        let tx = SearchIndexTx {
-            added: &mut Vec::new(),
-            removed: &mut Vec::new(),
-        };
+        let tx = Default::default();
         f(tx)?;
         let mut writer = self.index.writer(50_000_000)?;
-        for entry in tx.added {
+        for entry in tx.get_added() {
             writer.add_document(doc!(
                 self.id_schema => format!("{}", entry.get_id()),
                 self.title_schema => entry.get_title(),
                 self.content_schema => entry.get_content(),
             ));
         }
-        for entry in tx.removed {
+        for entry in tx.get_removed() {
             let id_term = Term::from_field_text(self.id_schema, &entry);
             writer.delete_term(id_term);
         }
