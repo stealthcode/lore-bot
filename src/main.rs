@@ -290,9 +290,9 @@ impl SearchIndex {
     }
 
     fn mutate<'a, F>(self, f: F) -> tantivy::Result<()>
-        where F: FnOnce(SearchIndexTx) -> tantivy::Result<()>
+        where F: FnOnce(&SearchIndexTx) -> tantivy::Result<()>
     {
-        let tx = Default::default();
+        let tx = &Default::default();
         f(tx)?;
         let mut writer = self.index.writer(50_000_000)?;
         for entry in tx.get_added() {
